@@ -116,6 +116,8 @@ export default function Estimator() {
   const [additionalCosts, setAdditionalCosts] = useState<AdditionalCostItem[]>([
     createAdditionalCostItem(),
   ]);
+  const dragFrameRef = useRef<number>(0);
+  const lastVibrateTimeRef = useRef<number>(0);
   const [deviceReadiness, setDeviceReadiness] = useState<DeviceReadiness>({
     gpsAccuracyFeet: null,
     connectionLabel: "Unknown connection",
@@ -591,68 +593,135 @@ export default function Estimator() {
     if (file) void handlePhotoCapture(file);
   };
 
-  const updateCornerFromPointer = useCallback((
-    clientX: number,
-    clientY: number,
-    cornerIndex: number
-  ) => {
-    if (!containerRef.current || !state.photoUrl) return;
-    const rect = containerRef.current.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
-
-    const x = ((clientX - rect.left) / rect.width) * 100;
-    const y = ((clientY - rect.top) / rect.height) * 100;
-
-    setState(prev => {
-      const newCorners = [...prev.corners];
-      newCorners[cornerIndex] = {
-        x: Math.max(0, Math.min(100, x)),
-        y: Math.max(0, Math.min(100, y)),
+  const resolvePointerCoords = useCallback(
+    (event: PointerEvent<HTMLButtonElement>) => {
+      const typed = event as PointerEvent & {
+        touches?: readonly { clientX: number; clientY: number }[];
+        changedTouches?: readonly { clientX: number; clientY: number }[];
       };
 
-      const squareFeet =
-        prev.imageWidth && prev.imageHeight
-          ? calculateSquareFeetFromCorners(
-              newCorners,
-              prev.imageWidth,
-              prev.imageHeight
-            )
-          : prev.squareFeet;
+      const touchList = typed.touches ?? typed.changedTouches;
+      if (touchList && touchList.length > 0) {
+        const item = touchList[0]
+        return { clientX: item.clientX, clientY: item.clientY };
+      }
 
-      return { ...prev, corners: newCorners, squareFeet };
+      return { clientX: event.clientX, clientY: event.clientY };
+    },
+    []
+  );
+
+  const pendingDragRef = useRef<{
+    clientX: number;
+    clientY: number;
+    cornerIndex: number;
+  } | null>(null);
+
+  const scheduleDragUpdate = useCallback(() => {
+    if (dragFrameRef.current !== 0) return;
+    dragFrameRef.current = requestAnimationFrame(() => {
+      dragFrameRef.current = 0;
+      const pending = pendingDragRef.current;
+      if (pending) {
+        updateCornerFromPointer(pending.clientX, pending.clientY, pending.cornerIndex);
+        pendingDragRef.current = null;
+      }
+      triggerHaptic();
     });
-  }, [state.photoUrl]);
+  }, [updateCornerFromPointer, triggerHaptic]);
 
-  const handleCornerPointerDown = useCallback((
-    event: PointerEvent<HTMLButtonElement>,
-    index: number
-  ) => {
-    event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    setDraggingCorner(index);
-    updateCornerFromPointer(event.clientX, event.clientY, index);
-    
-    // Add haptic feedback on supported devices
-    if ('vibrate' in navigator && navigator.vibrate) {
-      navigator.vibrate(10);
+  const updateCornerFromPointer = useCallback(
+    (clientX: number, clientY: number, cornerIndex: number) => {
+      if (!containerRef.current || !state.photoUrl) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+
+      const x = Math.max(0, Math.min(100, ((clientX - rect.left) / rect.width) * 100));
+      const y = Math.max(0, Math.min(100, ((clientY - rect.top) / rect.height) * 100));
+
+      setState(prev => {
+        const newCorners = [...prev.corners];
+        newCorners[cornerIndex] = { x, y };
+
+        const squareFeet =
+          prev.imageWidth && prev.imageHeight
+            ? calculateSquareFeetFromCorners(
+                newCorners,
+                prev.imageWidth,
+                prev.imageHeight
+              )
+            : prev.squareFeet;
+
+        return { ...prev, corners: newCorners, squareFeet };
+      });
+    },
+    [state.photoUrl]
+  );
+
+  const triggerHaptic = useCallback(() => {
+    if (typeof navigator === "undefined") return;
+    const now = Date.now();
+    if (now - lastVibrateTimeRef.current < 40) return;
+
+    const vibrator = (navigator as unknown as { vibrate?: (ms: number) => boolean }).vibrate;
+    if (typeof vibrator === "function") {
+      try {
+        vibrator(10);
+        lastVibrateTimeRef.current = now;
+      } catch {
+        lastVibrateTimeRef.current = now;
+      }
     }
-  }, [updateCornerFromPointer]);
-
-  const handleCornerPointerMove = useCallback((
-    event: PointerEvent<HTMLButtonElement>,
-    index: number
-  ) => {
-    if (draggingCorner !== index) return;
-    event.preventDefault();
-    updateCornerFromPointer(event.clientX, event.clientY, index);
-  }, [draggingCorner, updateCornerFromPointer]);
-
-  const handleCornerPointerEnd = useCallback((event: PointerEvent<HTMLButtonElement>) => {
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-    setDraggingCorner(null);
   }, []);
+
+  const handleCornerPointerDown = useCallback(
+    (event: PointerEvent<HTMLButtonElement>, index: number) => {
+      event.preventDefault();
+      event.stopPropagation();
+      event.currentTarget.setPointerCapture(event.pointerId);
+
+      const coords = resolvePointerCoords(event);
+      pendingDragRef.current = { ...coords, cornerIndex: index };
+
+      setDraggingCorner(index);
+      updateCornerFromPointer(coords.clientX, coords.clientY, index);
+      triggerHaptic();
+
+      containerRef.current?.setAttribute("data-dragging-corner", String(index));
+    },
+    [resolvePointerCoords, triggerHaptic, updateCornerFromPointer]
+  );
+
+  const handleCornerPointerMove = useCallback(
+    (event: PointerEvent<HTMLButtonElement>, index: number) => {
+      if (draggingCorner !== index) return;
+      event.preventDefault();
+      event.stopPropagation();
+
+      const coords = resolvePointerCoords(event);
+      pendingDragRef.current = { ...coords, cornerIndex: index };
+      scheduleDragUpdate();
+    },
+    [draggingCorner, resolvePointerCoords, scheduleDragUpdate]
+  );
+
+  const handleCornerPointerEnd = useCallback(
+    (event: PointerEvent<HTMLButtonElement>) => {
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+
+      if (dragFrameRef.current !== 0) {
+        cancelAnimationFrame(dragFrameRef.current);
+        dragFrameRef.current = 0;
+      }
+
+      pendingDragRef.current = null;
+      setDraggingCorner(null);
+      containerRef.current?.removeAttribute("data-dragging-corner");
+    },
+    []
+  );
 
   const handleMaterialSelect = (material: Material) => {
     setState(prev => {
@@ -1348,153 +1417,42 @@ export default function Estimator() {
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div
-                ref={containerRef}
-                className="relative w-full touch-none overflow-hidden rounded-lg bg-black"
-                style={{ aspectRatio: photoAspectRatio }}
-              >
-                <img
-                  src={state.photoUrl}
-                  alt="Driveway"
-                  className="h-full w-full select-none object-cover"
-                  draggable={false}
-                />
-
-                {state.corners.length >= 3 && (
-                  <svg
-                    aria-hidden="true"
-                    className="pointer-events-none absolute inset-0 h-full w-full"
-                    preserveAspectRatio="none"
-                    viewBox="0 0 100 100"
-                  >
-                    <polygon
-                      points={cornerPolygon}
-                      fill="rgba(37, 99, 235, 0.16)"
-                      stroke="rgb(96, 165, 250)"
-                      strokeWidth="0.75"
-                      vectorEffect="non-scaling-stroke"
-                    />
-                  </svg>
-                )}
-
-                {/* Corner Markers */}
-                {state.corners.map((corner, i) => (
-                  <button
-                    key={i}
-                    type="button"
-                    aria-label={`Adjust driveway corner ${i + 1}`}
-                    onPointerDown={event => handleCornerPointerDown(event, i)}
-                    onPointerMove={event => handleCornerPointerMove(event, i)}
-                    onPointerUp={handleCornerPointerEnd}
-                    onPointerCancel={handleCornerPointerEnd}
-                    onLostPointerCapture={() => setDraggingCorner(null)}
-                    className={`absolute h-12 w-12 -translate-x-1/2 -translate-y-1/2 touch-none rounded-full border-2 border-white shadow-lg shadow-black/30 outline-none ring-offset-2 ring-offset-slate-900 transition-all duration-150 ${
-                      draggingCorner === i 
-                        ? 'bg-blue-400 scale-110 active:bg-blue-300' 
-                        : 'bg-blue-500 hover:bg-blue-600 focus-visible:ring-2 focus-visible:ring-blue-300 active:bg-blue-400'
-                    }`}
-                    style={{ 
-                      left: `${corner.x}%`, 
-                      top: `${corner.y}%`,
-                      touchAction: 'none'
-                    }}
+                <div
+                  ref={containerRef}
+                  className="relative w-full touch-none overflow-hidden rounded-lg bg-black"
+                  style={{ aspectRatio: photoAspectRatio }}
+                  onTouchStart={event => {
+                    if (draggingCorner !== null) event.preventDefault();
+                  }}
+                  onTouchMove={event => {
+                    if (draggingCorner !== null) event.preventDefault();
+                  }}
+                >
+                  <img
+                    src={state.photoUrl}
+                    alt="Driveway"
+                    className="h-full w-full select-none object-cover"
+                    draggable={false}
                   />
-                ))}
-              </div>
 
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <div>
-                  <Label className="text-slate-300">Detected Area</Label>
-                  <p className="text-2xl font-bold text-white">
-                    {state.squareFeet} sq ft
-                  </p>
-                  {(state.detectionDescription ||
-                    state.detectionConfidence != null) && (
-                    <div className="mt-3 rounded-md border border-blue-400/20 bg-slate-900/70 p-3 text-sm text-slate-200">
-                      <p className="font-semibold text-white">
-                        AI boundary read
-                      </p>
-                      {state.detectionDescription && (
-                        <p className="mt-1 leading-6 text-slate-300">
-                          {state.detectionDescription}
-                        </p>
-                      )}
-                      {state.detectionConfidence != null && (
-                        <p className="mt-2 text-blue-300">
-                          Confidence:{" "}
-                          {Math.round(state.detectionConfidence * 100)}%
-                        </p>
-                      )}
-                    </div>
+                  {state.corners.length >= 3 && (
+                    <svg
+                      aria-hidden="true"
+                      className="pointer-events-none absolute inset-0 h-full w-full"
+                      preserveAspectRatio="none"
+                      viewBox="0 0 100 100"
+                    >
+                      <polygon
+                        points={cornerPolygon}
+                        fill="rgba(37, 99, 235, 0.16)"
+                        stroke="rgb(96, 165, 250)"
+                        strokeWidth="0.75"
+                        vectorEffect="non-scaling-stroke"
+                      />
+                    </svg>
                   )}
-                </div>
-                <div>
-                  <Label className="text-slate-300">Depth</Label>
-                  <Input
-                    type="number"
-                    min="1"
-                    max="12"
-                    value={state.depthInches}
-                    onChange={e => {
-                      const depth = Number(e.target.value);
-                      setState(prev => ({
-                        ...prev,
-                        depthInches: Number.isFinite(depth)
-                          ? Math.min(12, Math.max(1, Math.round(depth)))
-                          : prev.depthInches,
-                      }));
-                    }}
-                    className="bg-slate-700 border-slate-600 text-white"
-                  />
-                  <p className="text-xs text-slate-400">inches</p>
-                </div>
-              </div>
 
-              <div className="grid gap-3 sm:grid-cols-2">
-                <Button
-                  onClick={() => setStep("material")}
-                  className="w-full bg-blue-600 hover:bg-blue-700 text-white"
-                >
-                  Continue to Materials
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => setStep("upload")}
-                >
-                  Capture Another Photo
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        )}
-
-        {/* Material Selection Step */}
-        {step === "material" && (
-          <Card className="bg-slate-800 border-slate-700">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-white">
-                <Wand2 className="h-5 w-5 text-emerald-200" />
-                AI Image Generator
-              </CardTitle>
-              <CardDescription>
-                Pick a surface, tune the prompt, then generate a client-ready
-                driveway preview from the captured photo.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              {state.photoUrl && (
-                <div className="grid gap-4 lg:grid-cols-[1.1fr_0.9fr]">
-                  <div
-                    className="relative overflow-hidden rounded-xl border border-white/12 bg-black"
-                    style={{ aspectRatio: photoAspectRatio }}
-                  >
-                    <img
-                      src={state.photoUrl}
-                      alt="Captured driveway"
-                      className="h-full w-full object-cover"
-                    />
-                    {state.corners.length >= 3 && (
+                  {state.corners.length >= 3 && (
                       <svg
                         aria-hidden="true"
                         className="pointer-events-none absolute inset-0 h-full w-full"
