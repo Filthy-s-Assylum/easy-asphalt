@@ -360,28 +360,113 @@ export default function Estimator() {
       img.src = dataUrl;
     });
 
+  const HEIC_MIME_TYPES = new Set([
+    "image/heic",
+    "image/heif",
+    "image/heic-sequence",
+    "image/heif-sequence",
+  ]);
+
+  const inferMimeTypeFromName = (name: string) => {
+    const lowerName = name.toLowerCase();
+    if (lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg")) {
+      return "image/jpeg";
+    }
+    if (lowerName.endsWith(".png")) return "image/png";
+    if (lowerName.endsWith(".webp")) return "image/webp";
+    if (lowerName.endsWith(".heic")) return "image/heic";
+    if (lowerName.endsWith(".heif")) return "image/heif";
+    return null;
+  };
+
+  const replaceFileExtension = (name: string, extension: string) => {
+    const base = name.replace(/\.[^/.]+$/, "");
+    return `${base || "driveway-photo"}.${extension}`;
+  };
+
+  const convertDataUrlToJpeg = (dataUrl: string, fileName: string) =>
+    new Promise<{ file: File; dataUrl: string }>((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const context = canvas.getContext("2d");
+        if (!context) {
+          reject(new Error("Unable to prepare image for upload"));
+          return;
+        }
+        context.drawImage(img, 0, 0);
+        canvas.toBlob(
+          blob => {
+            if (!blob) {
+              reject(new Error("Unable to prepare image for upload"));
+              return;
+            }
+            const jpegFile = new File(
+              [blob],
+              replaceFileExtension(fileName, "jpg"),
+              {
+                type: "image/jpeg",
+                lastModified: Date.now(),
+              }
+            );
+            resolve({ file: jpegFile, dataUrl: canvas.toDataURL("image/jpeg", 0.92) });
+          },
+          "image/jpeg",
+          0.92
+        );
+      };
+      img.onerror = () => reject(new Error("Unable to read image file"));
+      img.src = dataUrl;
+    });
+
+  const normalizePhotoFile = async (file: File) => {
+    const inferredMimeType = file.type || inferMimeTypeFromName(file.name);
+    if (!inferredMimeType || !inferredMimeType.startsWith("image/")) {
+      throw new Error("Upload a JPG, PNG, WebP, or HEIC image");
+    }
+
+    let dataUrl = await readFileAsDataUrl(file);
+    let normalizedFile = file;
+
+    if (!file.type && inferredMimeType) {
+      const blob = await fetch(dataUrl).then(response => response.blob());
+      normalizedFile = new File([blob], file.name, {
+        type: inferredMimeType,
+        lastModified: file.lastModified,
+      });
+    }
+
+    if (HEIC_MIME_TYPES.has(inferredMimeType)) {
+      const converted = await convertDataUrlToJpeg(dataUrl, file.name);
+      normalizedFile = converted.file;
+      dataUrl = converted.dataUrl;
+    }
+
+    if (!ACCEPTED_IMAGE_TYPES.has(normalizedFile.type)) {
+      throw new Error("Upload a JPG, PNG, or WebP image");
+    }
+
+    if (normalizedFile.size > MAX_IMAGE_BYTES) {
+      throw new Error("Image must be 10 MB or smaller");
+    }
+
+    return { file: normalizedFile, dataUrl };
+  };
+
   const handlePhotoCapture = async (file: File) => {
-    if (!ACCEPTED_IMAGE_TYPES.has(file.type)) {
-      toast.error("Upload a JPG, PNG, or WebP image");
-      return;
-    }
-
-    if (file.size > MAX_IMAGE_BYTES) {
-      toast.error("Image must be 10 MB or smaller");
-      return;
-    }
-
     setLoading(true);
     try {
-      const dataUrl = await readFileAsDataUrl(file);
+      const { file: normalizedFile, dataUrl } = await normalizePhotoFile(file);
       const base64 = dataUrl.split(",")[1];
       if (!base64) throw new Error("Image file did not contain base64 data");
 
       const dimensions = await loadImageDimensions(dataUrl);
       const result = await uploadPhotoMutation.mutateAsync({
         photoBase64: base64,
-        photoName: file.name,
-        photoMimeType: file.type,
+        photoName: normalizedFile.name,
+        photoMimeType: normalizedFile.type,
         imageWidth: dimensions.width,
         imageHeight: dimensions.height,
       });
@@ -390,7 +475,7 @@ export default function Estimator() {
         ...prev,
         photoUrl: result.photoUrl,
         photoKey: result.photoKey,
-        photoMimeType: file.type,
+        photoMimeType: normalizedFile.type,
         imageWidth: dimensions.width,
         imageHeight: dimensions.height,
         corners: result.corners,
@@ -418,7 +503,8 @@ export default function Estimator() {
       );
       setStep("material");
     } catch (error) {
-      toast.error("Failed to process photo");
+      const message = error instanceof Error ? error.message : "Failed to process photo";
+      toast.error(message);
       console.error(error);
     } finally {
       setLoading(false);
@@ -1283,14 +1369,14 @@ export default function Estimator() {
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept="image/jpeg,image/png,image/webp"
+                  accept="image/jpeg,image/png,image/webp,image/heic,image/heif"
                   onChange={handleFileInputChange}
                   className="hidden"
                 />
                 <input
                   ref={cameraInputRef}
                   type="file"
-                  accept="image/jpeg,image/png,image/webp"
+                  accept="image/jpeg,image/png,image/webp,image/heic,image/heif"
                   capture="environment"
                   onChange={handleFileInputChange}
                   className="hidden"
